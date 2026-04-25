@@ -1,0 +1,87 @@
+# Playto KYC Pipeline - Explainer
+
+**1. The State Machine.** Where does your state machine live in the code? Paste the function or class. How do you prevent an illegal transition?
+My state machine lives in `kyc/state_machine.py`. It uses a dictionary mapping to explicitly define allowed outgoing edges from any given status.
+```python
+class KYCStateMachine:
+    TRANSITIONS = {
+        'draft': {'submit': 'submitted'},
+        'submitted': {'review': 'under_review'},
+        'under_review': {'approve': 'approved', 'reject': 'rejected', 'request_info': 'more_info_requested'},
+        'more_info_requested': {'submit': 'submitted'}
+    }
+
+    @staticmethod
+    def transition(submission: KYCSubmission, action: str, reviewer=None, notes: str = "") -> KYCSubmission:
+        current_state = submission.status
+        allowed_actions = KYCStateMachine.TRANSITIONS.get(current_state, {})
+        
+        if action not in allowed_actions:
+            raise IllegalStateTransitionError(
+                f"Cannot perform action '{action}' from state '{current_state}'."
+            )
+        # ... logic to save status
+```
+Illegal transitions are prevented by raising an `IllegalStateTransitionError` which is strictly caught in the DRF view `transition()` method, immediately returning an HTTP 400 Bad Request if the current action is invalid.
+
+**2. The Upload.** How are you validating file uploads? Paste the validation code. What happens if someone sends a 50 MB file?
+I enforce a custom DRF validator living in `kyc/validators.py`. It is passed directly into the `FileField` models via the model serializer.
+```python
+from rest_framework.exceptions import ValidationError
+
+ALLOWED_MIME_TYPES = ['application/pdf', 'image/jpeg', 'image/png']
+MAX_FILE_SIZE = 5 * 1024 * 1024  # 5 MB
+
+def validate_kyc_document(file):
+    if not file: return
+        
+    if file.size > MAX_FILE_SIZE:
+        raise ValidationError(f"File size exceeds 5MB limit. Got: {file.size / (1024*1024):.2f}MB")
+        
+    file_name = file.name.lower()
+    valid_extensions = ['.pdf', '.jpg', '.jpeg', '.png']
+    if not any(file_name.endswith(ext) for ext in valid_extensions):
+        raise ValidationError("Invalid file type. Acceptable types are PDF, JPG, PNG.")
+```
+If a user attempts to send a 50 MB file, DRF halts execution during `serializer.is_valid()` before saving the file locally. It intercepts `file.size` and immediately throws a strict HTTP 400 Bad Request mapped to the respective field with the size exception message.
+
+**3. The Queue.** Paste the query that powers the reviewer dashboard (queue list, SLA flag). Why did you write it this way?
+The list view's query is defined elegantly in the ViewSet `get_queryset()`:
+```python
+if user.role == 'REVIEWER':
+    return KYCSubmission.objects.all().order_by('submitted_at', 'created_at')
+```
+For the dashboard's numerical statistics (queue size, etc), in `kyc/views.py`:
+```python
+queue_count = KYCSubmission.objects.filter(status__in=['submitted', 'under_review']).count()
+```
+The SLA flag computes dynamically and cleanly in memory on the Serializer output payload by utilizing a `SerializerMethodField`:
+```python
+def get_is_at_risk(self, obj):
+    if obj.status in ['submitted', 'under_review'] and obj.submitted_at:
+        return (timezone.now() - obj.submitted_at) > timedelta(hours=24)
+    return False
+```
+I chose to compute SLA flags dynamically via serializer at request-time because saving a "stale" boolean column like `is_at_risk=True` directly into the database necessitates cumbersome cron jobs pointing over timestamps. Re-evaluating chronologically using Python at request time is stateless, keeps my single source of truth (the original submission timestamp) clean, and eliminates desyncing issues or manual flag management entirely.
+
+**4. The Auth.** How does your system stop merchant A from seeing merchant B's submission? Paste the check.
+I heavily restrict object collections natively at the database query layer utilizing `get_queryset` of the `KYCSubmissionViewSet`. By filtering via the request's authenticated user during any HTTP interactions, Merchant A cannot ever query or alter Merchant B's object instances.
+```python
+def get_queryset(self):
+    user = self.request.user
+    if user.role == 'REVIEWER':
+        return KYCSubmission.objects.all().order_by('submitted_at', 'created_at')
+    
+    # MERCHANT restricted path checks constraint
+    return KYCSubmission.objects.filter(merchant=user).order_by('-created_at')
+```
+
+**5. The AI Audit.** One specific example where an AI tool wrote code that was buggy or insecure. Paste what it gave you, what you caught, and what you replaced it with.
+*AI code recommendation:*
+```python
+class KYCSubmission(models.Model):
+   # ...
+   pan_document = models.FileField(upload_to='kyc_docs/', validators=[FileExtensionValidator(['pdf', 'jpg'])])
+```
+*Issue:* The `FileExtensionValidator` generated by the LLM relies entirely and solely on the string trailing text of the file descriptor name. Advanced bad actors could easily embed `.php` or a destructive binary executable by simply renaming their payload shell string inside `image.jpg`.
+*My fix:* I threw out the LLM's generic suggestion entirely and built a custom structural wrapper `validate_kyc_document` that does rigid cross-platform checking mapping size payloads directly alongside `content_type` tracking so we strictly isolate files. Furthermore, the base AI suggestion completely ignored the architectural boundary definition requiring to cap uploads at 5MB, leaving the application brutally exposed to basic DOS capabilities from unlimited data streams. My replacement natively denies large injections immediately.
